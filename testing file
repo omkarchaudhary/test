@@ -1,0 +1,849 @@
+package com.yourcompany.ivrauth.model;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Value Object to hold all contextual information for an IVR session.
+ * This will be stored and updated in the State Machine's ExtendedState.
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class ContextVO {
+    // Session Identifiers
+    private String contextId;
+    private String ani; // Automatic Number Identification (caller's phone number)
+    private String dnis; // Dialed Number Identification Service (number caller dialed)
+    private String lob;  // Line of Business (e.g., "CON" for Consumer, "BIZ" for Business)
+
+    // Authentication State
+    private AuthLevel authLevel;
+    private Set<AuthToken> validatedTokens; // Set of token TYPES that have been successfully validated
+    private Set<AuthToken> failedTokens;    // Set of token TYPES that failed validation in the current step
+
+    // Attempt Tracking
+    private AtomicInteger totalAttemptCount;
+    private Map<AuthToken, AtomicInteger> tokenAttemptCounts; // Attempts per specific token type
+
+    // IVR Flow Management (What the IVR should prompt)
+    private List<AuthToken> nextTokensToAsk; // The specific token types the IVR should prompt for next
+    private List<StepUpPath> stepUpPaths;    // Possible paths to higher authentication levels (for IVR display/decision)
+
+    // Data from external systems (pre-populated by another API call)
+    // These would typically be complex objects representing customer data
+    private Map<String, Object> aniDetails;   // e.g., caller name, address info based on ANI lookup
+    private Map<String, Object> accountDetails; // e.g., list of accounts, account status
+    private Map<String, Object> partyDetails;   // e.g., customer segment, VIP status
+    private Map<String, Object> otherInfo;      // Any other dynamic data
+
+    // Transient fields for the current authentication step
+    private AuthToken lastTokenAsked; // The specific token type that was last requested from IVR
+
+    public ContextVO(String contextId, String ani, String dnis, String lob) {
+        this.contextId = contextId;
+        this.ani = ani;
+        this.dnis = dnis;
+        this.lob = lob;
+        this.authLevel = AuthLevel.NONE;
+        this.validatedTokens = new HashSet<>();
+        this.failedTokens = new HashSet<>();
+        this.totalAttemptCount = new AtomicInteger(0);
+        this.tokenAttemptCounts = new HashMap<>();
+        this.nextTokensToAsk = new ArrayList<>();
+        this.stepUpPaths = new ArrayList<>();
+        this.aniDetails = new HashMap<>();
+        this.accountDetails = new HashMap<>();
+        this.partyDetails = new HashMap<>();
+        this.otherInfo = new HashMap<>();
+    }
+
+    public ContextVO initializeForNewSession(String contextId, String ani, String dnis, String lob) {
+        // This is a "deep copy" style initialization, or just setting defaults
+        this.contextId = contextId;
+        this.ani = ani;
+        this.dnis = dnis;
+        this.lob = lob;
+        this.authLevel = AuthLevel.NONE;
+        this.validatedTokens = new HashSet<>();
+        this.failedTokens = new HashSet<>();
+        this.totalAttemptCount = new AtomicInteger(0);
+        this.tokenAttemptCounts = new HashMap<>();
+        this.nextTokensToAsk = new ArrayList<>();
+        this.stepUpPaths = new ArrayList<>();
+
+        // Simulate pre-population of contextVO
+        this.aniDetails = Map.of("name", "John Doe", "address", "123 Main St");
+        this.accountDetails = Map.of("accountNumber", "ACC12345", "status", "Active");
+        this.partyDetails = Map.of("segment", "Gold", "vipStatus", true);
+        this.otherInfo = Map.of("serviceType", "Broadband");
+
+        this.lastTokenAsked = null;
+        return this;
+    }
+}
+
+package com.yourcompany.ivrauth.model;
+
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+
+/**
+ * Request from IVR team to /authentication.
+ * contextId will be in HTTP Header.
+ * ani, dnis, lob, and other static details are part of ContextVO.
+ */
+@Data
+@Builder
+@NoArgsConstructor // For JSON deserialization when payload is empty
+@AllArgsConstructor // For Builder to work with all fields
+public class AuthRequest {
+    private String stepUpPathId; // Client sends from previous response (StepUpPath.id)
+
+    // Nested object for input value
+    private InputData input;
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class InputData {
+        private String value;
+    }
+}
+
+package com.yourcompany.ivrauth.model;
+
+import lombok.Builder;
+import lombok.Data;
+
+import java.util.List;
+import java.util.Set;
+
+// Response back to the IVR team
+@Data
+@Builder
+public class AuthResponse {
+    private String contextId;
+    private String ani;
+    private String dnis;
+    private String lob;
+    private AuthLevel authLevel; // The current authentication level achieved
+    private Set<AuthToken> validatedTokens; // List of token TYPES that have been successfully validated
+    private Set<AuthToken> failedTokens; // List of token TYPES that failed validation in this step
+
+    // For the IVR to know what to ask next
+    private List<AuthToken> nextTokensToAsk; // The specific token types the IVR should prompt for
+
+    // List of possible step-up paths to reach higher authentication levels or "leaf nodes"
+    private List<StepUpPath> stepUpPaths;
+
+    private String message;
+    private boolean authenticated;
+    private boolean authFailed;
+    private State currentState; // For debugging/IVR flow tracking (optional)
+}
+
+package com.yourcompany.ivrauth.service;
+
+import com.yourcompany.ivrauth.model.*;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.statemachine.StateMachine;
+import org.springframework.statemachine.config.StateMachineFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Service
+@Slf4j
+public class AuthMachineService {
+
+    private final StateMachineFactory<State, Event> stateMachineFactory;
+    // Map to hold active state machines, keyed by contextId.
+    // The ExtendedState of each StateMachine will contain the ContextVO.
+    private final Map<String, StateMachine<State, Event>> activeStateMachines = new ConcurrentHashMap<>();
+    private final DNISConfigService dnisConfigService;
+
+    public AuthMachineService(StateMachineFactory<State, Event> stateMachineFactory, DNISConfigService dnisConfigService) {
+        this.stateMachineFactory = stateMachineFactory;
+        this.dnisConfigService = dnisConfigService;
+    }
+
+    public AuthResponse authenticate(String contextIdHeader, AuthRequest request, String ani, String dnis, String lob) {
+        String contextId = contextIdHeader; // ContextId now comes from header
+
+        // If contextId is null (first call), generate it.
+        // On subsequent calls, it must be provided in the header.
+        if (contextId == null || contextId.isEmpty()) {
+            contextId = UUID.randomUUID().toString();
+            log.info("Generated new context ID for initial call: {}", contextId);
+        }
+
+        StateMachine<State, Event> stateMachine = activeStateMachines.computeIfAbsent(contextId, id -> {
+            log.info("Creating new state machine for context ID: {}", id);
+            StateMachine<State, Event> sm = stateMachineFactory.getStateMachine(id);
+            sm.start(); // Start the machine
+            return sm;
+        });
+
+        // Ensure state machine is started (important if retrieved from map but not started, though start() is idempotent)
+        if (!stateMachine.isRunning()) {
+            stateMachine.start();
+        }
+
+        // Retrieve or initialize ContextVO
+        ContextVO contextVO = (ContextVO) stateMachine.getExtendedState().getVariables().get("contextVO");
+
+        Message<Event> message;
+        if (request == null || request.getInput() == null || request.getInput().getValue() == null || request.getInput().getValue().isEmpty()) {
+            // This is the initial call OR a call with an empty input (e.g., re-prompt)
+            if (contextVO == null) {
+                // This *must* be the very first call for this contextId
+                contextVO = new ContextVO(contextId, ani, dnis, lob).initializeForNewSession(contextId, ani, dnis, lob);
+                stateMachine.getExtendedState().getVariables().put("contextVO", contextVO); // Store it
+                log.info("Initialized new ContextVO for contextId: {}", contextId);
+            } else {
+                // If ContextVO exists but input is empty, means IVR is re-asking for current token
+                log.warn("Empty input received for contextId {} after initial call. Re-prompting for last asked token.", contextId);
+                // We'll let the processTokenInput handle the "empty input" failure
+            }
+
+            message = MessageBuilder
+                    .withEvent(Event.INITIATE_AUTH_FLOW)
+                    .setHeader("contextVO", contextVO) // Pass the ContextVO for initialization/access
+                    .build();
+        } else {
+            // Subsequent calls with provided input value and stepUpPathId
+            if (contextVO == null) {
+                // This indicates an error state: subsequent call without prior contextVO initialization
+                log.error("Received subsequent request for contextId {} without an existing ContextVO. Cannot proceed.", contextId);
+                return buildErrorResponse(contextId, "Invalid session or missing context.");
+            }
+
+            log.info("Processing input value '{}' for contextId: {}, StepUpPathId: {}",
+                    request.getInput().getValue(), contextId, request.getStepUpPathId());
+
+            message = MessageBuilder
+                    .withEvent(Event.INPUT_RECEIVED)
+                    .setHeader("contextVO", contextVO) // Pass the ContextVO for updates/access
+                    .setHeader("inputValue", request.getInput().getValue())
+                    .setHeader("stepUpPathId", request.getStepUpPathId()) // Pass stepUpPathId
+                    .build();
+        }
+
+        // Send the event and wait for completion
+        boolean sent = stateMachine.sendEvent(message);
+        if (!sent) {
+            log.error("Failed to send event {} for contextId {}. Current state: {}",
+                    message.getPayload(), contextId, stateMachine.getState().getId());
+            return buildErrorResponse(contextId, "Failed to process authentication event. Please try again.");
+        }
+
+        // Retrieve current state and updated ContextVO from the state machine
+        ContextVO updatedContextVO = (ContextVO) stateMachine.getExtendedState().getVariables().get("contextVO");
+        State currentState = stateMachine.getState().getId();
+
+        // Build response based on machine state and updated ContextVO
+        AuthResponse.AuthResponseBuilder responseBuilder = AuthResponse.builder()
+                .contextId(updatedContextVO.getContextId())
+                .ani(updatedContextVO.getAni())
+                .dnis(updatedContextVO.getDnis())
+                .lob(updatedContextVO.getLob())
+                .authLevel(updatedContextVO.getAuthLevel())
+                .validatedTokens(updatedContextVO.getValidatedTokens())
+                .failedTokens(updatedContextVO.getFailedTokens())
+                .currentState(currentState);
+
+        if (updatedContextVO.getAuthenticated()) {
+            responseBuilder
+                    .message("Authentication successful!")
+                    .authenticated(true)
+                    .authFailed(false)
+                    .nextTokensToAsk(Collections.emptyList())
+                    .stepUpPaths(Collections.emptyList());
+            // Remove the state machine for successful sessions
+            activeStateMachines.remove(contextId);
+            log.info("Context {} authenticated. Level: {}. Remaining active state machines: {}", contextId, updatedContextVO.getAuthLevel(), activeStateMachines.size());
+        } else if (updatedContextVO.getAuthFailed()) {
+            responseBuilder
+                    .message("Authentication failed. Too many attempts or invalid input.")
+                    .authenticated(false)
+                    .authFailed(true)
+                    .nextTokensToAsk(Collections.emptyList())
+                    .stepUpPaths(Collections.emptyList());
+            // Remove failed state machines
+            activeStateMachines.remove(contextId);
+            log.info("Context {} authentication failed. Remaining active state machines: {}", contextId, activeStateMachines.size());
+        } else {
+            // Still in progress, need more tokens
+            responseBuilder
+                    .message("Please provide the requested information.")
+                    .authenticated(false)
+                    .authFailed(false)
+                    .nextTokensToAsk(updatedContextVO.getNextTokensToAsk())
+                    .stepUpPaths(updatedContextVO.getStepUpPaths());
+        }
+
+        log.info("Response for contextId {}: CurrentState={}, AuthLevel={}, Authenticated={}, Failed={}, NextTokens={}, StepUpPathsCount={}",
+                updatedContextVO.getContextId(), responseBuilder.currentState, responseBuilder.authLevel, responseBuilder.authenticated,
+                responseBuilder.authFailed, responseBuilder.nextTokensToAsk, responseBuilder.stepUpPaths.size());
+
+        return responseBuilder.build();
+    }
+
+    private AuthResponse buildErrorResponse(String contextId, String message) {
+        log.error("Building error response for contextId {}: {}", contextId, message);
+        return AuthResponse.builder()
+                .contextId(contextId)
+                .ani("N/A") // Or retrieve from cache if available
+                .dnis("N/A")
+                .lob("N/A")
+                .authLevel(AuthLevel.NONE)
+                .validatedTokens(Collections.emptySet())
+                .failedTokens(Collections.emptySet())
+                .nextTokensToAsk(Collections.emptyList())
+                .stepUpPaths(Collections.emptyList())
+                .message(message)
+                .authenticated(false)
+                .authFailed(true)
+                .currentState(State.FAILED_AUTHENTICATION)
+                .build();
+    }
+}
+
+package com.yourcompany.ivrauth.config;
+
+import com.yourcompany.ivrauth.model.AuthLevel;
+import com.yourcompany.ivrauth.model.AuthToken;
+import com.yourcompany.ivrauth.model.ContextVO;
+import com.yourcompany.ivrauth.model.Event;
+import com.yourcompany.ivrauth.model.State;
+import com.yourcompany.ivrauth.model.StepUpPath;
+import com.yourcompany.ivrauth.service.DNISConfigService;
+import com.yourcompany.ivrauth.service.TokenValidationService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.statemachine.action.Action;
+import org.springframework.statemachine.config.EnableStateMachineFactory;
+import org.springframework.statemachine.config.EnumStateMachineConfigurerAdapter;
+import org.springframework.statemachine.config.builders.StateMachineConfigurationConfigurer;
+import org.springframework.statemachine.config.builders.StateMachineStateConfigurer;
+import org.springframework.statemachine.config.builders.StateMachineTransitionConfigurer;
+import org.springframework.statemachine.guard.Guard;
+
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+@Configuration
+@EnableStateMachineFactory
+@Slf4j
+public class StateMachineConfig extends EnumStateMachineConfigurerAdapter<State, Event> {
+
+    private static final int MAX_ATTEMPTS_PER_TOKEN = 3; // Max attempts allowed for a single token type
+    private static final int MAX_TOTAL_ATTEMPTS = 5; // Max total attempts for the entire flow
+
+    private final TokenValidationService tokenValidationService;
+    private final DNISConfigService dnisConfigService;
+
+    public StateMachineConfig(TokenValidationService tokenValidationService, DNISConfigService dnisConfigService) {
+        this.tokenValidationService = tokenValidationService;
+        this.dnisConfigService = dnisConfigService;
+    }
+
+    @Override
+    public void configure(StateMachineConfigurationConfigurer<State, Event> config) throws Exception {
+        config
+                .withConfiguration()
+                .autoStartup(true)
+                .listener(new StateMachineListener());
+    }
+
+    @Override
+    public void configure(StateMachineStateConfigurer<State, Event> states) throws Exception {
+        states
+                .withStates()
+                .initial(State.START_AUTHENTICATION)
+                .states(java.util.EnumSet.allOf(State.class))
+                .end(State.AUTHENTICATED_READ_ONLY)
+                .end(State.AUTHENTICATED_UPDATE)
+                .end(State.FAILED_AUTHENTICATION);
+    }
+
+    @Override
+    public void configure(StateMachineTransitionConfigurer<State, Event> transitions) throws Exception {
+        transitions
+                // Initial request: empty payload -> Calculate initial tokens to ask
+                .withExternal()
+                    .source(State.START_AUTHENTICATION)
+                    .target(State.ASK_TOKEN) // Transition to a generic "ask token" state
+                    .event(Event.INITIATE_AUTH_FLOW)
+                    .action(initializeAuthentication())
+                .and()
+
+                // When input is received from IVR (subsequent calls)
+                .withExternal()
+                    .source(State.ASK_TOKEN) // From any ASK_TOKEN state
+                    .target(State.PROCESSING_INPUT) // Go to a processing state first
+                    .event(Event.INPUT_RECEIVED)
+                    .action(processTokenInput())
+                .and()
+
+                // After processing input: If token validated, update context and decide next state
+                .withExternal()
+                    .source(State.PROCESSING_INPUT)
+                    .target(State.AUTHENTICATED_UPDATE)
+                    .event(Event.TOKEN_VALIDATED)
+                    .guard(isAuthenticated(AuthLevel.UPDATE_ACCESS)) // Guard to check if UPDATE_ACCESS is achieved
+                    .action(setAuthLevel(AuthLevel.UPDATE_ACCESS))
+                .and()
+                .withExternal()
+                    .source(State.PROCESSING_INPUT)
+                    .target(State.AUTHENTICATED_READ_ONLY)
+                    .event(Event.TOKEN_VALIDATED)
+                    .guard(isAuthenticated(AuthLevel.READ_ONLY)) // Guard to check if READ_ONLY is achieved
+                    .action(setAuthLevel(AuthLevel.READ_ONLY))
+                .and()
+                .withExternal()
+                    .source(State.PROCESSING_INPUT)
+                    .target(State.ASK_TOKEN) // If validated but need more tokens for higher level
+                    .event(Event.TOKEN_VALIDATED)
+                    .guard(needsMoreTokens())
+                    .action(prepareForNextPrompt())
+                .and()
+                .withExternal()
+                    .source(State.PROCESSING_INPUT)
+                    .target(State.FAILED_AUTHENTICATION)
+                    .event(Event.TOKEN_VALIDATED) // Should not happen with current guards, but as a safeguard
+                    .guard(noMoreTokensButNotAuthenticated())
+                    .action(failAuthentication())
+                .and()
+
+                // After processing input: If token failed validation
+                .withExternal()
+                    .source(State.PROCESSING_INPUT)
+                    .target(State.ASK_TOKEN) // Re-ask the same token or try next (if allowed)
+                    .event(Event.TOKEN_FAILED)
+                    .guard(canRetryToken()) // Check if attempts left for current token
+                    .action(prepareForNextPrompt())
+                .and()
+                .withExternal()
+                    .source(State.PROCESSING_INPUT)
+                    .target(State.FAILED_AUTHENTICATION)
+                    .event(Event.TOKEN_FAILED)
+                    .guard(maxAttemptsReachedForToken()) // No more attempts for current token
+                    .action(failAuthentication())
+                .and()
+
+                // General failure state transition (e.g., if total attempts exceed limit)
+                .withExternal()
+                    .source(State.ASK_TOKEN)
+                    .target(State.FAILED_AUTHENTICATION)
+                    .event(Event.MAX_ATTEMPTS_REACHED)
+                    .action(failAuthentication());
+    }
+
+    // --- Actions ---
+
+    private Action<State, Event> initializeAuthentication() {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getMessageHeader("contextVO");
+            if (contextVO == null) {
+                log.error("ContextVO is null during initialization. This should not happen.");
+                context.getExtendedState().sendEvent(Event.AUTH_FAILURE); // Trigger immediate failure
+                return;
+            }
+
+            // The ContextVO is already initialized by AuthMachineService, just put it into extended state
+            context.getExtendedState().getVariables().put("contextVO", contextVO);
+
+            log.info("Initializing authentication for contextId: {}", contextVO.getContextId());
+
+            // Determine initial tokens to ask based on DNIS configuration
+            List<AuthToken> initialTokens = dnisConfigService.getInitialTokensToAsk(contextVO.getDnis());
+            contextVO.setNextTokensToAsk(initialTokens);
+            contextVO.setFailedTokens(Collections.emptySet()); // Clear any previous failed tokens
+
+            if (initialTokens.isEmpty()) {
+                // If no tokens are configured, default to READ_ONLY and send success event
+                log.info("No tokens configured for DNIS {}. Defaulting to READ_ONLY access.", contextVO.getDnis());
+                contextVO.setAuthLevel(AuthLevel.READ_ONLY);
+                contextVO.setAuthenticated(true); // Mark as authenticated
+                context.getExtendedState().sendEvent(Event.AUTH_SUCCESS);
+            } else {
+                contextVO.setLastTokenAsked(initialTokens.get(0)); // Store the first token asked
+                log.info("Initial tokens to ask for DNIS {}: {}. Last token asked: {}", contextVO.getDnis(), initialTokens, contextVO.getLastTokenAsked());
+            }
+        };
+    }
+
+    private Action<State, Event> processTokenInput() {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getMessageHeader("contextVO");
+            String inputValue = (String) context.getMessageHeader("inputValue");
+            String stepUpPathId = (String) context.getMessageHeader("stepUpPathId");
+
+            if (contextVO == null) {
+                log.error("ContextVO is null during input processing. Cannot proceed for contextId: {}", context.getStateMachine().getId());
+                context.getExtendedState().sendEvent(Event.AUTH_FAILURE); // Trigger immediate failure
+                return;
+            }
+
+            // Increment total attempt count
+            contextVO.getTotalAttemptCount().incrementAndGet();
+            if (contextVO.getTotalAttemptCount().get() > MAX_TOTAL_ATTEMPTS) {
+                log.warn("Max total attempts reached for contextId {}. Failing authentication.", contextVO.getContextId());
+                context.getExtendedState().sendEvent(Event.MAX_ATTEMPTS_REACHED);
+                return;
+            }
+
+            contextVO.getFailedTokens().clear(); // Clear failed tokens from previous attempt
+
+            if (inputValue == null || inputValue.isEmpty()) {
+                log.warn("Empty input received for contextId {}. Treating as failed input for last asked token.", contextVO.getContextId());
+                if (contextVO.getLastTokenAsked() != null) {
+                    contextVO.getTokenAttemptCounts().computeIfAbsent(contextVO.getLastTokenAsked(), k -> new AtomicInteger(0)).incrementAndGet();
+                    contextVO.getFailedTokens().add(contextVO.getLastTokenAsked());
+                }
+                context.getExtendedState().sendEvent(Event.TOKEN_FAILED); // Re-trigger asking current token
+                return;
+            }
+
+            AuthToken tokenToValidate = null;
+            if (stepUpPathId != null && !stepUpPathId.isEmpty()) {
+                // If stepUpPathId is provided, find the token type from that path
+                Optional<StepUpPath> selectedPath = contextVO.getStepUpPaths().stream()
+                        .filter(p -> p.getId().equals(stepUpPathId))
+                        .findFirst();
+
+                if (selectedPath.isPresent() && !selectedPath.get().getRequestTokenList().isEmpty()) {
+                    // Assume the input corresponds to the first token in the requestTokenList of the chosen path
+                    tokenToValidate = selectedPath.get().getRequestTokenList().get(0);
+                    // Update lastTokenAsked as this is the token type we are now expecting input for
+                    contextVO.setLastTokenAsked(tokenToValidate);
+                    log.info("Processing input for stepUpPathId {}. Expected token: {}", stepUpPathId, tokenToValidate);
+                } else {
+                    log.warn("StepUpPathId '{}' not found or invalid. Falling back to last asked token for contextId {}.", stepUpPathId, contextVO.getContextId());
+                    tokenToValidate = contextVO.getLastTokenAsked(); // Fallback
+                }
+            } else {
+                // If no stepUpPathId, assume input is for the last token we asked for (common scenario)
+                tokenToValidate = contextVO.getLastTokenAsked();
+                log.info("No stepUpPathId provided. Assuming input is for last asked token: {}", tokenToValidate);
+            }
+
+
+            if (tokenToValidate == null) {
+                log.error("No token type was expected for input: {} for contextId {}. Cannot proceed.", inputValue, contextVO.getContextId());
+                context.getExtendedState().sendEvent(Event.AUTH_FAILURE);
+                return;
+            }
+
+            // Increment attempt count for this specific token
+            contextVO.getTokenAttemptCounts().computeIfAbsent(tokenToValidate, k -> new AtomicInteger(0)).incrementAndGet();
+
+            log.info("Validating input '{}' for token type '{}' for contextId {}", inputValue, tokenToValidate, contextVO.getContextId());
+
+            boolean isValid = tokenValidationService.validateToken(contextVO.getDnis(), tokenToValidate, inputValue);
+
+            if (isValid) {
+                log.info("Token {} validated successfully for contextId {}.", tokenToValidate, contextVO.getContextId());
+                contextVO.getValidatedTokens().add(tokenToValidate); // Add to successfully validated set
+                contextVO.getTokenAttemptCounts().get(tokenToValidate).set(0); // Reset attempts for this token after success
+
+                // Re-determine auth level based on updated validated tokens
+                AuthLevel newAuthLevel = tokenValidationService.determineAuthLevel(contextVO.getDnis(), contextVO.getValidatedTokens());
+                contextVO.setAuthLevel(newAuthLevel);
+
+                // Determine next tokens to ask and step-up paths for the IVR
+                List<AuthToken> updatedNextTokensToAsk = determineNextTokensToAsk(contextVO.getDnis(), contextVO.getValidatedTokens(), newAuthLevel);
+                contextVO.setNextTokensToAsk(updatedNextTokensToAsk);
+                contextVO.setStepUpPaths(dnisConfigService.generateStepUpPaths(contextVO.getDnis(), contextVO.getValidatedTokens(), newAuthLevel));
+
+                // Set the next token the IVR should ask for based on the calculated list
+                contextVO.setLastTokenAsked(updatedNextTokensToAsk.isEmpty() ? null : updatedNextTokensToAsk.get(0));
+
+                context.getExtendedState().sendEvent(Event.TOKEN_VALIDATED);
+
+            } else {
+                log.warn("Token {} validation failed for input '{}' for contextId {}. Attempts left: {}",
+                        tokenToValidate, inputValue, contextVO.getContextId(), (MAX_ATTEMPTS_PER_TOKEN - contextVO.getTokenAttemptCounts().get(tokenToValidate).get()));
+                contextVO.getFailedTokens().add(tokenToValidate); // Add to failed tokens for current response
+                context.getExtendedState().sendEvent(Event.TOKEN_FAILED);
+            }
+        };
+    }
+
+    private Action<State, Event> setAuthLevel(AuthLevel level) {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getExtendedState().getVariables().get("contextVO");
+            if (contextVO == null) return; // Should not happen
+
+            contextVO.setAuthLevel(level);
+            contextVO.setAuthenticated(true);
+            contextVO.setAuthFailed(false);
+            contextVO.setNextTokensToAsk(Collections.emptyList());
+            contextVO.setStepUpPaths(Collections.emptyList());
+            contextVO.getFailedTokens().clear(); // Clear failed tokens
+            contextVO.setLastTokenAsked(null); // No more tokens to ask
+            log.info("Authentication successful with level: {} for contextId {}.", level, contextVO.getContextId());
+        };
+    }
+
+    private Action<State, Event> prepareForNextPrompt() {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getExtendedState().getVariables().get("contextVO");
+            if (contextVO == null) return; // Should not happen
+
+            // If the event was TOKEN_FAILED and canRetryToken is true, lastTokenAsked is already set.
+            // If it was TOKEN_VALIDATED but needs more tokens, nextTokensToAsk has been set, and lastTokenAsked updated.
+            // So, this action simply ensures state is ready for the next prompt.
+            log.debug("Preparing for next prompt. Current nextTokensToAsk: {}. Last token asked: {}. ContextId: {}",
+                    contextVO.getNextTokensToAsk(), contextVO.getLastTokenAsked(), contextVO.getContextId());
+        };
+    }
+
+    private Action<State, Event> failAuthentication() {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getExtendedState().getVariables().get("contextVO");
+            if (contextVO == null) return; // Should not happen
+
+            contextVO.setAuthenticated(false);
+            contextVO.setAuthFailed(true);
+            contextVO.setAuthLevel(AuthLevel.NONE);
+            contextVO.setNextTokensToAsk(Collections.emptyList());
+            contextVO.setStepUpPaths(Collections.emptyList());
+            contextVO.getFailedTokens().clear(); // Clear failed tokens
+            contextVO.setLastTokenAsked(null); // No more tokens to ask
+            log.warn("Authentication failed for contextId {}. Max attempts reached or unrecoverable error.", contextVO.getContextId());
+        };
+    }
+
+    // --- Guards ---
+
+    private Guard<State, Event> isAuthenticated(AuthLevel targetLevel) {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getExtendedState().getVariables().get("contextVO");
+            if (contextVO == null) return false;
+            boolean condition = contextVO.getAuthLevel().ordinal() >= targetLevel.ordinal();
+            log.debug("Guard 'isAuthenticated({}): CurrentLevel={}, Result={}' for contextId: {}",
+                    targetLevel, contextVO.getAuthLevel(), condition, contextVO.getContextId());
+            return condition;
+        };
+    }
+
+    private Guard<State, Event> needsMoreTokens() {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getExtendedState().getVariables().get("contextVO");
+            if (contextVO == null) return false;
+            boolean condition = !contextVO.getNextTokensToAsk().isEmpty();
+            log.debug("Guard 'needsMoreTokens': NextTokens={}. Result: {} for contextId: {}",
+                    contextVO.getNextTokensToAsk(), condition, contextVO.getContextId());
+            return condition;
+        };
+    }
+
+    private Guard<State, Event> noMoreTokensButNotAuthenticated() {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getExtendedState().getVariables().get("contextVO");
+            if (contextVO == null) return false;
+            boolean condition = contextVO.getNextTokensToAsk().isEmpty() && !contextVO.getAuthenticated();
+            log.debug("Guard 'noMoreTokensButNotAuthenticated': NextTokens={}, Authenticated={}. Result: {} for contextId: {}",
+                    contextVO.getNextTokensToAsk(), contextVO.getAuthenticated(), condition, contextVO.getContextId());
+            return condition;
+        };
+    }
+
+    private Guard<State, Event> canRetryToken() {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getExtendedState().getVariables().get("contextVO");
+            if (contextVO == null || contextVO.getLastTokenAsked() == null) return false;
+
+            AuthToken tokenInQuestion = contextVO.getLastTokenAsked();
+            int attempts = contextVO.getTokenAttemptCounts().getOrDefault(tokenInQuestion, new AtomicInteger(0)).get();
+
+            boolean condition = attempts < MAX_ATTEMPTS_PER_TOKEN;
+            log.debug("Guard 'canRetryToken({})': Attempts={}, MaxAttempts={}. Result: {} for contextId: {}",
+                    tokenInQuestion, attempts, MAX_ATTEMPTS_PER_TOKEN, condition, contextVO.getContextId());
+            return condition;
+        };
+    }
+
+    private Guard<State, Event> maxAttemptsReachedForToken() {
+        return context -> {
+            ContextVO contextVO = (ContextVO) context.getExtendedState().getVariables().get("contextVO");
+            if (contextVO == null || contextVO.getLastTokenAsked() == null) return false;
+
+            AuthToken tokenInQuestion = contextVO.getLastTokenAsked();
+            int attempts = contextVO.getTokenAttemptCounts().getOrDefault(tokenInQuestion, new AtomicInteger(0)).get();
+
+            boolean condition = attempts >= MAX_ATTEMPTS_PER_TOKEN;
+            log.debug("Guard 'maxAttemptsReachedForToken({})': Attempts={}, MaxAttempts={}. Result: {} for contextId: {}",
+                    tokenInQuestion, attempts, MAX_ATTEMPTS_PER_TOKEN, condition, contextVO.getContextId());
+            return condition;
+        };
+    }
+
+
+    // --- Helper for determining next tokens to ask ---
+    private List<AuthToken> determineNextTokensToAsk(String dnis, Set<AuthToken> currentValidatedTokens, AuthLevel currentAuthLevel) {
+        if (currentAuthLevel == AuthLevel.UPDATE_ACCESS) {
+            return Collections.emptyList(); // If highest level reached, no more tokens needed
+        }
+
+        List<AuthToken> possibleTokensForDnis = dnisConfigService.getPossibleTokensForDNIS(dnis);
+
+        // Find the first token in the pre-defined sequence for this DNIS that hasn't been validated yet.
+        for (AuthToken token : possibleTokensForDnis) {
+            if (!currentValidatedTokens.contains(token)) {
+                return Collections.singletonList(token); // Return the next single token to ask
+            }
+        }
+        // If all possible tokens are validated but UPDATE_ACCESS is not achieved, then no more to ask.
+        return Collections.emptyList();
+    }
+
+    // --- State Machine Listener (for logging) ---
+    @Slf4j
+    private static class StateMachineListener extends org.springframework.statemachine.listener.StateMachineListenerAdapter<State, Event> {
+        @Override
+        public void stateChanged(org.springframework.statemachine.state.State<State, Event> from, org.springframework.statemachine.state.State<State, Event> to) {
+            log.info("State changed from {} to {}", from != null ? from.getId() : "null", to.getId());
+        }
+
+        @Override
+        public void eventNotAccepted(org.springframework.statemachine.event.Event<Event> event) {
+            log.warn("Event {} not accepted in current state.", event.getPayload());
+        }
+    }
+}
+
+
+package com.yourcompany.ivrauth.service;
+
+import com.yourcompany.ivrauth.model.AuthLevel;
+import com.yourcompany.ivrauth.model.AuthToken;
+import com.yourcompany.ivrauth.model.ContextVO;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.Set;
+
+@Service
+@Slf4j
+public class TokenValidationService {
+
+    private final DNISConfigService dnisConfigService;
+
+    public TokenValidationService(DNISConfigService dnisConfigService) {
+        this.dnisConfigService = dnisConfigService;
+    }
+
+    /**
+     * Simulates validating a single token against the caller's actual data from ContextVO.
+     * In a real system, this would look up the actual user data using contextVO (e.g., ani, accountDetails).
+     */
+    public boolean validateToken(String dnis, AuthToken tokenType, String providedValue, ContextVO contextVO) {
+        // --- SIMULATED VALIDATION LOGIC ---
+        // This is where you would integrate with your backend systems (e.g., database, LDAP, external APIs).
+        // Use contextVO.getAni(), contextVO.getAccountDetails(), etc., to fetch real data for validation.
+        log.info("Validating DNIS: {}, Token Type: {}, Provided Value: {}, Context ANI: {}",
+                 dnis, tokenType, providedValue, contextVO.getAni());
+
+        // Example: Validate SSN against actual customer's SSN stored in contextVO's partyDetails
+        if (tokenType == AuthToken.SSN) {
+            String actualSSN = (String) contextVO.getPartyDetails().get("ssnLast4"); // Assume last 4 SSN is stored
+            return providedValue.equals(actualSSN);
+        }
+        if (tokenType == AuthToken.DOB) {
+            String actualDOB = (String) contextVO.getAniDetails().get("dob"); // Assume DOB is stored
+            return providedValue.equals(actualDOB);
+        }
+        if (tokenType == AuthToken.EMP_ID) {
+            String actualEmpId = (String) contextVO.getAccountDetails().get("employeeId");
+            return providedValue.equals(actualEmpId);
+        }
+        if (tokenType == AuthToken.ACCOUNT_ID) {
+            String actualAccountId = (String) contextVO.getAccountDetails().get("accountNumber");
+            return providedValue.equals(actualAccountId);
+        }
+
+        return false; // Unknown token type or no validation logic
+    }
+
+    /**
+     * Determines the highest authentication level achieved given the set of successfully validated tokens.
+     */
+    public AuthLevel determineAuthLevel(String dnis, Set<AuthToken> validatedTokens) {
+        AuthLevel highestAchieved = AuthLevel.NONE;
+        for (DNISConfigService.AuthLevelRule rule : dnisConfigService.getAuthLevelRulesForDNIS(dnis)) {
+            if (validatedTokens.containsAll(rule.requiredTokens)) {
+                if (rule.authLevel.ordinal() > highestAchieved.ordinal()) {
+                    highestAchieved = rule.authLevel;
+                }
+            }
+        }
+        log.info("Determined AuthLevel for DNIS {} with validated tokens {}: {}", dnis, validatedTokens, highestAchieved);
+        return highestAchieved;
+    }
+}
+
+
+package com.yourcompany.ivrauth.controller;
+
+import com.yourcompany.ivrauth.model.AuthRequest;
+import com.yourcompany.ivrauth.model.AuthResponse;
+import com.yourcompany.ivrauth.service.AuthMachineService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/authentication")
+@Slf4j
+public class AuthController {
+
+    private final AuthMachineService authMachineService;
+
+    public AuthController(AuthMachineService authMachineService) {
+        this.authMachineService = authMachineService;
+    }
+
+    @PostMapping
+    public ResponseEntity<AuthResponse> authenticate(
+            @RequestHeader(value = "X-Session-ID", required = false) String contextId, // ContextId from header
+            @RequestHeader(value = "X-ANI", required = false) String ani, // Initial call provides these
+            @RequestHeader(value = "X-DNIS", required = false) String dnis, // Initial call provides these
+            @RequestHeader(value = "X-LOB", required = false) String lob, // Initial call provides these
+            @RequestBody(required = false) AuthRequest request) {
+
+        // If request body is null, it's an initial call or a re-prompt with no input value.
+        // We ensure a non-null request object is passed to the service.
+        if (request == null) {
+            log.info("Received initial authentication request or re-prompt with empty body.");
+            request = AuthRequest.builder().build();
+        } else {
+            log.info("Received authentication request for contextId: {} with body: {}", contextId, request);
+        }
+
+        // Pass headers and request body to the service
+        AuthResponse response = authMachineService.authenticate(contextId, request, ani, dnis, lob);
+        return new ResponseEntity<>(response, HttpStatus.OK);
+    }
+}
